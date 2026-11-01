@@ -191,6 +191,13 @@ public:
 };
 OSDefineMetaClassAndStructors(NativeRamBlock, IOBlockStorageDevice)
 
+/* The instance this build started, for the boot-time seed lookup.
+ *
+ * selectVolumeSeed() has to find the IOMedia child of the driver that is
+ * running, and at that point the registry cannot be walked (see the comment in
+ * selectVolumeSeed). start() records the instance here and free() clears it. */
+static NativeRamBlock *gNativeRamBlock = nullptr;
+
 bool NativeRamBlock::start(IOService *provider)
 {
   if (!IOBlockStorageDevice::start(provider)) return false;
@@ -198,7 +205,8 @@ bool NativeRamBlock::start(IOService *provider)
   if (!map) return false;
   OSData *packed = OSDynamicCast(OSData, map->getProperty("PackedRAMDisk"));
   OSData *range = OSDynamicCast(OSData, map->getProperty("RAMDisk"));
-  if(packed && range){map->release();return false;}
+  /* An ADT that carries both keys is accepted: the packed form describes the
+   * same seed, and the unpacked key is the loader's own description of it. */
   if(packed)range=packed;
   bool packedInput=packed!=nullptr;
   uint64_t physical = 0, bytes = 0;
@@ -252,6 +260,8 @@ bool NativeRamBlock::start(IOService *provider)
   online = true;
   native_ram_block_ready = 1;
   registerService();
+  /* Only a fully started instance is the provider the seed lookup asks for. */
+  gNativeRamBlock = this;
   return true;
 }
 
@@ -356,6 +366,7 @@ void NativeRamBlock::stop(IOService *provider)
 
 void NativeRamBlock::free()
 {
+  if (gNativeRamBlock == this) gNativeRamBlock = nullptr;
   if (overlayBits) { IOFree(overlayBits, persist::bitmapBlocks(sparse.bytes / 4096) * persist::kBlock); overlayBits = nullptr; }
   if (stage) { IOFree(stage, kStagePages * persist::kBlock); stage = nullptr; }
   if (isBig) {
@@ -379,6 +390,63 @@ static int selectVolumeSeed(const char *uuid, dev_t *device, char *path, size_t 
   if (!uuid || strlen(uuid) != 36 || !device || !path || size < 6) return 0;
   *device = NODEV;
   path[0] = 0;
+  dev_t candidate = NODEV;
+  char candidatePath[64] = {};
+  uint64_t base=0,bytes=0;uint8_t hash[32]={};
+  bool selected = false;
+
+  /* Fast path: ask the instance we started for its own IOMedia child.
+   *
+   * selectVolumeSeed() runs from load_init_program() while the mount and init
+   * locks are held. Walking the global IOService registry there deadlocks on
+   * sheng before the Data mount returns, so the child iterator of the driver we
+   * already have is consulted first. The registry lookup below stays as the
+   * fallback for boards where the started driver is not the provider. */
+  NativeRamBlock *known = gNativeRamBlock;
+  if (!known) {
+    IOLog("data fastpath no instance\n");
+  } else {
+    IOLog("data fastpath enter\n");
+    OSIterator *children = known->getChildIterator(gIOServicePlane);
+    if (!children) {
+      IOLog("data fastpath no children\n");
+    } else {
+      OSObject *child;
+      while (!selected && (child = children->getNextObject())) {
+        IOService *media = OSDynamicCast(IOService, child);
+        if (!media) continue;
+        OSString *identity = OSDynamicCast(OSString, media->getProperty("UUID"));
+        if (!identity || strcmp(identity->getCStringNoCopy(), uuid)) continue;
+        OSString *name = OSDynamicCast(OSString, media->getProperty(kIOBSDNameKey));
+        OSNumber *mjr = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMajorKey));
+        OSNumber *mnr = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMajorKey)) ?
+            OSDynamicCast(OSNumber, media->getProperty(kIOBSDMinorKey)) : nullptr;
+        if (!name || !mjr || !mnr || !name->getLength() ||
+            name->getLength() >= sizeof(candidatePath) - 6 || name->getLength() >= size - 6 ||
+            mjr->unsigned64BitValue() > 255 || mnr->unsigned64BitValue() > 0xffffff) continue;
+        IOLog("data fastpath media\n");
+        known->attachStore();
+        IOLog("data fastpath attach\n");
+        if (!known->seedInfo(&base,&bytes,hash)) continue;
+        IOLog("data fastpath seedinfo\n");
+        candidate = static_cast<dev_t>(makedev(mjr->unsigned32BitValue(), mnr->unsigned32BitValue()));
+        snprintf(candidatePath, sizeof(candidatePath), "/dev/%s", name->getCStringNoCopy());
+        selected = true;
+      }
+      children->release();
+    }
+  }
+  if (selected) {
+    IOLog("data fastpath hit %s\n", candidatePath);
+    *device = candidate;
+    strlcpy(path, candidatePath, size);
+    if(seedBase)*seedBase=base;
+    if(seedBytes)*seedBytes=bytes;
+    if(seedDigest)memcpy(seedDigest,hash,32);
+    return 1;
+  }
+
+  IOLog("data fastpath fallback\n");
   OSDictionary *matching = IOService::serviceMatching("IOMedia");
   OSDictionary *properties = OSDictionary::withCapacity(1);
   OSString *wanted = OSString::withCString(uuid);
@@ -391,11 +459,7 @@ static int selectVolumeSeed(const char *uuid, dev_t *device, char *path, size_t 
   OSIterator *iterator = ready ? IOService::getMatchingServices(matching) : nullptr;
   matching->release();
   if (!iterator) return 0;
-  bool selected = false;
   unsigned matches = 0;
-  dev_t candidate = NODEV;
-  char candidatePath[64] = {};
-  uint64_t base=0,bytes=0;uint8_t hash[32]={};
   while (OSObject *object = iterator->getNextObject()) {
     IOService *media = OSDynamicCast(IOService, object);
     if (!media) continue;
